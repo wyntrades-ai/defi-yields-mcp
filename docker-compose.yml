@@ -1,0 +1,87 @@
+version: '3.8'
+
+services:
+  defi-yields-http:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: defi-yields-http
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=${WORKERS:-2}
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - defi-yields-network
+    volumes:
+      - ./logs:/app/logs
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.defi-yields.rule=Host(`${DOMAIN:-localhost}`)"
+      - "traefik.http.routers.defi-yields.entrypoints=web"
+      - "traefik.http.services.defi-yields.loadbalancer.server.port=8000"
+
+  # Optional: Nginx reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: defi-yields-nginx
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - defi-yields-http
+    networks:
+      - defi-yields-network
+    restart: unless-stopped
+    profiles:
+      - production
+
+  # Optional: Redis for caching (future enhancement)
+  redis:
+    image: redis:7-alpine
+    container_name: defi-yields-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - defi-yields-network
+    restart: unless-stopped
+    profiles:
+      - cache
+
+  # Optional: Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: defi-yields-prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - defi-yields-network
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+networks:
+  defi-yields-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
