@@ -13,6 +13,10 @@ services:
       - PORT=8000
       - WORKERS=${WORKERS:-2}
       - PYTHONPATH=/app
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_ENABLED=${CACHE_ENABLED:-true}
+      - CACHE_TTL=${CACHE_TTL:-300}
+      - CACHE_PREFIX=defi_yields:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"]
@@ -20,6 +24,8 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
+    depends_on:
+      - redis
     networks:
       - defi-yields-network
     volumes:
@@ -46,7 +52,7 @@ services:
     profiles:
       - production
 
-  # Optional: Redis for caching (future enhancement)
+  # Redis for caching
   redis:
     image: redis:7-alpine
     container_name: defi-yields-redis
@@ -55,8 +61,11 @@ services:
     networks:
       - defi-yields-network
     restart: unless-stopped
-    profiles:
-      - cache
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Optional: Prometheus for monitoring
   prometheus:

@@ -9,6 +9,8 @@ allowing it to run as a streamable HTTP service that can be Dockerized.
 import asyncio
 import json
 import logging
+import os
+import hashlib
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
@@ -18,6 +20,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
+import redis.asyncio as aioredis
 
 # Import the MCP server functions
 from src.defi_yields_mcp import get_yield_pools, analyze_yields
@@ -55,6 +58,92 @@ class HealthResponse(BaseModel):
 # Global variables
 startup_time = 0
 
+# Redis connection
+redis_client: Optional[aioredis.Redis] = None
+
+async def get_redis_client():
+    """Get or create Redis client connection"""
+    global redis_client
+    if redis_client is None:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        redis_client = await aioredis.from_url(redis_url, decode_responses=True)
+    return redis_client
+
+async def close_redis_client():
+    """Close Redis client connection"""
+    global redis_client
+    if redis_client:
+        await redis_client.close()
+        redis_client = None
+
+def cache_key(chain: Optional[str] = None, project: Optional[str] = None) -> str:
+    """Generate cache key for yield pools request"""
+    key_data = f"yield_pools:{chain or 'all'}:{project or 'all'}"
+    return f"defi_yields:{hashlib.md5(key_data.encode()).hexdigest()}"
+
+async def get_cached_pools(key: str) -> Optional[List[Dict[str, Any]]]:
+    """Get cached yield pools data"""
+    redis = await get_redis_client()
+    if not redis:
+        return None
+
+    try:
+        cached_data = await redis.get(key)
+        if cached_data:
+            return json.loads(cached_data)
+    except Exception as e:
+        logger.error(f"Redis cache get error: {e}")
+    return None
+
+async def cache_pools(key: str, pools: List[Dict[str, Any]], ttl: int = 300):
+    """Cache yield pools data"""
+    redis = await get_redis_client()
+    if not redis:
+        return
+
+    try:
+        await redis.setex(key, ttl, json.dumps(pools))
+    except Exception as e:
+        logger.error(f"Redis cache set error: {e}")
+
+async def get_yield_pools_cached(
+    chain: Optional[str] = None,
+    project: Optional[str] = None,
+    ctx: Optional[Any] = None
+) -> List[Dict[str, Any]]:
+    """Get yield pools with Redis caching"""
+
+    # Check if caching is enabled
+    cache_enabled = os.getenv("CACHE_ENABLED", "false").lower() == "true"
+    cache_ttl = int(os.getenv("CACHE_TTL", "300"))
+
+    if cache_enabled:
+        # Try cache first
+        key = cache_key(chain, project)
+        cached_result = await get_cached_pools(key)
+        if cached_result:
+            if ctx:
+                ctx.info(f"Cache hit for {key}")
+            return cached_result
+
+        if ctx:
+            ctx.info(f"Cache miss for {key}")
+
+    # Cache miss or disabled - fetch from API
+    if ctx:
+        ctx.info("Fetching yield pools from yields.llama.fi")
+
+    pools = await get_yield_pools(chain=chain, project=project, ctx=ctx)
+
+    # Cache the result
+    if cache_enabled and pools:
+        key = cache_key(chain, project)
+        await cache_pools(key, pools, cache_ttl)
+        if ctx:
+            ctx.info(f"Cached {len(pools)} pools for {key}")
+
+    return pools
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle"""
@@ -62,6 +151,14 @@ async def lifespan(app: FastAPI):
     import time
     startup_time = time.time()
     logger.info("DeFi Yields HTTP Server starting up...")
+
+    # Initialize Redis if enabled
+    if os.getenv("CACHE_ENABLED", "false").lower() == "true":
+        try:
+            await get_redis_client()
+            logger.info("Redis caching enabled")
+        except Exception as e:
+            logger.warning(f"Redis connection failed, caching disabled: {e}")
 
     # Test external API connectivity
     try:
@@ -75,6 +172,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Cleanup
+    await close_redis_client()
     logger.info("DeFi Yields HTTP Server shutting down...")
 
 # Create FastAPI app
@@ -118,6 +217,8 @@ async def root():
             "pools": "/pools",
             "pools_stream": "/pools/stream",
             "analyze": "/analyze",
+            "cache_stats": "/cache/stats",
+            "cache_clear": "/cache/clear",
             "docs": "/docs"
         }
     }
@@ -187,7 +288,7 @@ async def mcp_endpoint(request: Dict[str, Any]):
                     def error(self, message: str):
                         logger.error(f"MCP Context: {message}")
 
-                pools = await get_yield_pools(
+                pools = await get_yield_pools_cached(
                     chain=arguments.get("chain"),
                     project=arguments.get("project"),
                     ctx=MockContext()
@@ -290,7 +391,7 @@ async def get_pools(request: YieldPoolRequest):
             def error(self, message: str):
                 logger.error(f"MCP Context: {message}")
 
-        pools = await get_yield_pools(
+        pools = await get_yield_pools_cached(
             chain=request.chain,
             project=request.project,
             ctx=MockContext()
@@ -332,7 +433,7 @@ async def get_pools_stream(
             # Send initial chunk
             yield f"data: {json.dumps({'status': 'fetching', 'message': 'Fetching yield pools...'})}\n\n"
 
-            pools = await get_yield_pools(
+            pools = await get_yield_pools_cached(
                 chain=chain,
                 project=project,
                 ctx=MockContext()
@@ -399,13 +500,49 @@ async def refresh_data(background_tasks: BackgroundTasks):
                 def info(self, message: str):
                     logger.info(f"Background refresh: {message}")
 
-            await get_yield_pools(ctx=MockContext())
+            await get_yield_pools_cached(ctx=MockContext())
             logger.info("Background data refresh completed")
         except Exception as e:
             logger.error(f"Background data refresh failed: {e}")
 
     background_tasks.add_task(refresh_task)
     return {"status": "refresh_started", "message": "Background refresh initiated"}
+
+# Cache management endpoints
+@app.get("/cache/stats")
+async def get_cache_stats():
+    """Get cache statistics"""
+    redis = await get_redis_client()
+    if not redis:
+        return {"status": "disabled", "message": "Redis not available"}
+
+    try:
+        info = await redis.info()
+        keys = await redis.keys("defi_yields:*")
+        return {
+            "status": "enabled",
+            "total_keys": len(keys),
+            "memory_usage": info.get("used_memory_human"),
+            "connected_clients": info.get("connected_clients"),
+            "cache_keys": keys[:10]  # Show first 10 keys
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/cache/clear")
+async def clear_cache():
+    """Clear all cache entries"""
+    redis = await get_redis_client()
+    if not redis:
+        return {"status": "disabled", "message": "Redis not available"}
+
+    try:
+        keys = await redis.keys("defi_yields:*")
+        if keys:
+            await redis.delete(*keys)
+        return {"status": "success", "cleared_keys": len(keys)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import os
